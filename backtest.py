@@ -49,16 +49,13 @@ def signals(cs):
     for i in range(210, len(cs)):
         _, po, _, _, pc = cs[i - 1]
         _, o, h, l, c = cs[i]
-        body = abs(c - o)
-        if body == 0:
+        if abs(c - o) == 0:
             continue
         es = [E[0][i], E[1][i], E[2][i]]
         if pc > po and c < o and o >= pc and c <= po and c < min(es):
-            sig[i] = ("SHORT", h, (h - o) / body, (c - l) / body,
-                      (min(es) - c) / c * 100)
+            sig[i] = ("SHORT", h)
         elif pc < po and c > o and o <= pc and c >= po and c > max(es):
-            sig[i] = ("LONG", l, (h - c) / body, (o - l) / body,
-                      (c - max(es)) / c * 100)
+            sig[i] = ("LONG", l)
     return sig
 
 
@@ -133,7 +130,8 @@ def stats(tr, cutoff):
     avg = sum(t[0] for t in tr) / n
     rec = [t[0] for t in tr if t[1] >= cutoff]
     ra = f"{sum(rec) / len(rec):+.2f}R/{len(rec)}" if rec else "-"
-    return f"{n} lệnh | thắng {w / n * 100:.0f}% | TB {avg:+.2f}R | 1 năm gần: {ra}"
+    return (f"{n} lệnh | thắng {w / n * 100:.0f}% | TB {avg:+.2f}R"
+            f" | 1 năm gần: {ra}")
 
 
 def main():
@@ -152,43 +150,31 @@ def main():
             print("loi", x["instId"], e)
     max_ts = max(cs[-1][0] for cs, _ in data.values())
     cutoff = max_ts - 365 * 86400000
-    wicks = {"thuong": 99, "it rau": 0.15}
-    dists = {"<=3%": 3, "<=6%": 6, "moi khoang cach": 999}
-    tps = [1, 1.5, 2, "swing"]
-    res = {}
-    for wn, wv in wicks.items():
-        for dn, dv in dists.items():
-            for tp in tps:
-                trades = []
-                for inst, (cs, sig) in data.items():
-                    i = 210
-                    while i < len(cs) - 1:
-                        s = sig.get(i)
-                        if s and s[2] <= wv and s[3] <= wv and s[4] <= dv:
-                            r = simulate(cs, i, s[0], s[1], tp)
-                            if r:
-                                trades.append((r[0], cs[i][0], s[0]))
-                                i = r[1] + 1
-                                continue
-                        i += 1
-                res[(wn, dn, tp)] = trades
-    msg = (f"BACKTEST nến nhấn chìm khung ngày\n{len(data)} coin, "
-           f"SL ở đỉnh/đáy nến, giữ tối đa {MAXH} ngày\n"
+    tps = [1, 1.5, 2, 3, "swing"]
+    msg = (f"BACKTEST nến nhấn chìm khung ngày\n{len(data)} coin\n"
+           "Luật: nhấn chìm bao trọn thân nến trước, đóng cửa ngoài "
+           "cả 3 EMA. Không lọc râu, không lọc khoảng cách.\n"
+           f"Vào ở giá đóng cửa, SL ở đỉnh/đáy nến, giữ tối đa {MAXH} ngày\n"
            "(TP: số = chốt theo R, swing = đáy/đỉnh gần nhất)\n")
-    for wn in wicks:
-        for dn in dists:
-            msg += f"\n[{wn} | khoảng cách EMA {dn}]\n"
-            for tp in tps:
-                lab = f"TP {tp}R" if tp != "swing" else "TP swing"
-                msg += f"{lab}: {stats(res[(wn, dn, tp)], cutoff)}\n"
-    ok = [(k, v) for k, v in res.items() if len(v) >= 30]
-    if ok:
-        best = max(ok, key=lambda kv: sum(x[0] for x in kv[1]) / len(kv[1]))
-        k, v = best
-        msg += f"\nCấu hình tốt nhất (>=30 lệnh): {k}\n"
+    for tp in tps:
+        trades = []
+        for inst, (cs, sig) in data.items():
+            i = 210
+            while i < len(cs) - 1:
+                s = sig.get(i)
+                if s:
+                    r = simulate(cs, i, s[0], s[1], tp)
+                    if r:
+                        trades.append((r[0], cs[i][0], s[0]))
+                        i = r[1] + 1
+                        continue
+                i += 1
+        lab = f"TP {tp}R" if tp != "swing" else "TP swing"
+        msg += f"\n[{lab}]\n"
+        msg += f"Tất cả: {stats(trades, cutoff)}\n"
         for sd in ("LONG", "SHORT"):
-            msg += f"{sd}: {stats([x for x in v if x[2] == sd], cutoff)}\n"
-    msg += ("\nLưu ý: chỉ là dữ liệu quá khứ của top coin hiện tại, "
+            msg += f"{sd}: {stats([x for x in trades if x[2] == sd], cutoff)}\n"
+    msg += ("\nLưu ý: dữ liệu quá khứ của top coin hiện tại, "
             "chưa tính phí và trượt giá. Không phải lời khuyên đầu tư.")
     send(msg)
 
