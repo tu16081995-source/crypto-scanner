@@ -4,7 +4,8 @@ import requests
 
 BASE = "https://www.okx.com"
 TOP_N = 100
-MIN_SCORE = 3
+MAX_DIST = 3.0
+MIN_SCORE = 2
 STABLES = {"USDC", "DAI", "TUSD", "FDUSD", "USDD", "PYUSD", "USDG"}
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -56,21 +57,28 @@ def analyze(inst):
     es = [ema(closes, 34), ema(closes, 89), ema(closes, 200)]
     po, ph, pl, pc, pv = cs[-2]
     o, h, l, c, v = cs[-1]
-    if c == o:
+    body = abs(c - o)
+    pbody = abs(pc - po)
+    if body == 0 or pbody == 0 or body < 1.5 * pbody:
         return None
     side = None
     if pc > po and c < o and o >= pc and c <= po and c < min(es):
+        if h < min(es):
+            return None
         side, sl = "SHORT", h
         dist = (min(es) - c) / c * 100
     elif pc < po and c > o and o <= pc and c >= po and c > max(es):
+        if l > max(es):
+            return None
         side, sl = "LONG", l
         dist = (c - max(es)) / c * 100
     if not side:
         return None
+    if dist > MAX_DIST:
+        return None
     risk = abs(sl - c)
     if risk == 0:
         return None
-    body = abs(c - o)
     avg_body = sum(abs(x[3] - x[0]) for x in cs[-12:-2]) / 10
     avg_vol = sum(x[4] for x in cs[-22:-2]) / 20
     r6 = rsi(closes, 6)
@@ -82,9 +90,6 @@ def analyze(inst):
     if v >= 1.2 * avg_vol:
         score += 1
         why.append("volume cao")
-    if dist <= 4:
-        score += 1
-        why.append("gần EMA")
     if (side == "SHORT" and r6 >= 25) or (side == "LONG" and r6 <= 75):
         score += 1
         why.append("RSI chưa cực đoan")
@@ -125,18 +130,17 @@ def main():
     found.sort(key=lambda r: (-r["score"], r["side"] != "SHORT", r["dist"]))
     picks = [r for r in found if r["score"] >= MIN_SCORE][:2]
     if not picks:
-        send(f"Nến ngày vừa đóng: không có kèo nào đạt từ "
-             f"{MIN_SCORE}/4 điểm.\n"
-             f"({len(found)} coin nhấn chìm ngoài 3 EMA nhưng điểm thấp.)\n"
+        send(f"Nến ngày vừa đóng: không có kèo nhấn chìm nào nằm sát "
+             f"EMA (trong {MAX_DIST:.0f}%) đạt chuẩn.\n"
              "Không có kèo thì nghỉ, đừng ép vào lệnh.")
         return
-    msg = ("Kèo chọn lọc nến ngày vừa đóng\n"
+    msg = ("Kèo nhấn chìm sát EMA, nến ngày vừa đóng\n"
            "Theo backtest: SHORT có lợi thế, LONG gần hòa vốn.\n")
     for i, r in enumerate(picks, 1):
         tag = "" if r["side"] == "SHORT" else " (kèo yếu hơn)"
         msg += (
             f"\n{i}) {r['inst']} - {r['side']}{tag} "
-            f"(điểm {r['score']}/4)\n"
+            f"(điểm {r['score']}/3)\n"
             f"Vào ~{r['entry']:.6g}\n"
             f"SL tham khảo (đỉnh/đáy nến): {r['sl']:.6g} "
             f"({r['risk_pct']:.1f}%)\n"
