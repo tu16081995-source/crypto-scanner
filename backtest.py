@@ -4,153 +4,208 @@ import requests
 
 BASE = "https://www.okx.com"
 TOP_N = 100
-MAX_DIST = 3.0
-MIN_SCORE = 2
+PAGES = 10
+MAXH = 30
 STABLES = {"USDC", "DAI", "TUSD", "FDUSD", "USDD", "PYUSD", "USDG"}
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+NAMES = ["Nhấn chìm", "Evening Star", "Evening Doji Star", "Two Crows",
+         "Morning Star", "Morning Doji Star", "Abandoned Baby"]
 
 
-def api(path, params):
-    time.sleep(0.25)
-    return requests.get(BASE + path, params=params, timeout=20).json()
+def load(inst):
+    rows, after = [], None
+    for _ in range(PAGES):
+        p = {"instId": inst, "bar": "1Dutc", "limit": "100"}
+        if after:
+            p["after"] = after
+        r = requests.get(BASE + "/api/v5/market/history-candles",
+                         params=p, timeout=20).json()
+        d = r.get("data", [])
+        if not d:
+            break
+        rows += d
+        after = d[-1][0]
+        time.sleep(0.12)
+        if len(d) < 100:
+            break
+    rows = [x for x in rows if x[8] == "1"]
+    rows.sort(key=lambda x: int(x[0]))
+    return [(int(x[0]), float(x[1]), float(x[2]),
+             float(x[3]), float(x[4])) for x in rows]
 
 
-def candles(inst):
-    r = api("/api/v5/market/candles",
-            {"instId": inst, "bar": "1Dutc", "limit": "300"})
-    rows = [x for x in r.get("data", []) if x[8] == "1"]
-    rows.reverse()
-    return [(float(x[1]), float(x[2]), float(x[3]),
-             float(x[4]), float(x[5])) for x in rows]
-
-
-def ema(values, n):
+def ema_series(vals, n):
     k = 2 / (n + 1)
-    e = values[0]
-    for v in values[1:]:
+    out, e = [], vals[0]
+    for v in vals:
         e = v * k + e * (1 - k)
-    return e
+        out.append(e)
+    return out
 
 
-def rsi(closes, n=6):
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        d = closes[i] - closes[i - 1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    ag = sum(gains[:n]) / n
-    al = sum(losses[:n]) / n
-    for i in range(n, len(gains)):
-        ag = (ag * (n - 1) + gains[i]) / n
-        al = (al * (n - 1) + losses[i]) / n
-    if al == 0:
-        return 100.0
-    return 100 - 100 / (1 + ag / al)
+def green(x):
+    return x[4] > x[1]
 
 
-def analyze(inst):
-    cs = candles(inst)
-    if len(cs) < 210:
-        return None
-    closes = [x[3] for x in cs]
-    es = [ema(closes, 34), ema(closes, 89), ema(closes, 200)]
-    po, ph, pl, pc, pv = cs[-2]
-    o, h, l, c, v = cs[-1]
-    body = abs(c - o)
-    pbody = abs(pc - po)
-    if body == 0 or pbody == 0 or body < 1.5 * pbody:
-        return None
-    side = None
-    if pc > po and c < o and o >= pc and c <= po and c < min(es):
-        if h < min(es):
-            return None
-        side, sl = "SHORT", h
-        dist = (min(es) - c) / c * 100
-    elif pc < po and c > o and o <= pc and c >= po and c > max(es):
-        if l > max(es):
-            return None
-        side, sl = "LONG", l
-        dist = (c - max(es)) / c * 100
-    if not side:
-        return None
-    if dist > MAX_DIST:
-        return None
-    risk = abs(sl - c)
+def red(x):
+    return x[4] < x[1]
+
+
+def body(x):
+    return abs(x[4] - x[1])
+
+
+def blo(x):
+    return min(x[1], x[4])
+
+
+def bhi(x):
+    return max(x[1], x[4])
+
+
+def signals(cs):
+    cl = [x[4] for x in cs]
+    E = [ema_series(cl, n) for n in (34, 89, 200)]
+    sig = {n: {} for n in NAMES}
+    for i in range(210, len(cs)):
+        a, b, c = cs[i - 2], cs[i - 1], cs[i]
+        es = [E[0][i], E[1][i], E[2][i]]
+        avg = sum(body(x) for x in cs[i - 12:i - 2]) / 10
+        b1, b2 = body(a), body(b)
+        rng2 = b[2] - b[3]
+        mid1 = (a[1] + a[4]) / 2
+        top = max(a[2], b[2], c[2])
+        bot = min(a[3], b[3], c[3])
+        doji = rng2 > 0 and b2 <= 0.1 * rng2
+        small = b2 <= 0.5 * b1
+        big = b1 >= avg and b1 > 0
+        short_pos = c[4] < min(es) and top >= min(es)
+        long_pos = c[4] > max(es) and bot <= max(es)
+        # nhấn chìm (2 nến cuối)
+        if body(c) > 0:
+            if green(b) and red(c) and c[1] >= b[4] and c[4] <= b[1] \
+                    and c[4] < min(es):
+                sig["Nhấn chìm"][i] = ("SHORT", c[2])
+            elif red(b) and green(c) and c[1] <= b[4] and c[4] >= b[1] \
+                    and c[4] > max(es):
+                sig["Nhấn chìm"][i] = ("LONG", c[3])
+        if short_pos and big and green(a) and red(c) and c[4] < mid1:
+            star_up = min(b[1], b[4]) >= mid1
+            if star_up and small:
+                sig["Evening Star"][i] = ("SHORT", top)
+            if star_up and doji:
+                sig["Evening Doji Star"][i] = ("SHORT", top)
+            if red(b) and b[1] > a[4] and b[4] > a[4] \
+                    and b[4] <= c[1] <= b[1] and c[4] < a[4]:
+                sig["Two Crows"][i] = ("SHORT", top)
+        if long_pos and big and red(a) and green(c) and c[4] > mid1:
+            star_dn = max(b[1], b[4]) <= mid1
+            if star_dn and small:
+                sig["Morning Star"][i] = ("LONG", bot)
+            if star_dn and doji:
+                sig["Morning Doji Star"][i] = ("LONG", bot)
+        # Abandoned Baby (thân doji nằm ngoài thân 2 nến kề)
+        if doji and big:
+            if short_pos and green(a) and red(c) and c[4] < mid1 \
+                    and blo(b) > bhi(a) and blo(b) > bhi(c):
+                sig["Abandoned Baby"][i] = ("SHORT", top)
+            if long_pos and red(a) and green(c) and c[4] > mid1 \
+                    and bhi(b) < blo(a) and bhi(b) < blo(c):
+                sig["Abandoned Baby"][i] = ("LONG", bot)
+    return sig
+
+
+def simulate(cs, i, side, sl, rew):
+    entry = cs[i][4]
+    risk = abs(sl - entry)
     if risk == 0:
         return None
-    avg_body = sum(abs(x[3] - x[0]) for x in cs[-12:-2]) / 10
-    avg_vol = sum(x[4] for x in cs[-22:-2]) / 20
-    r6 = rsi(closes, 6)
-    score = 0
-    why = []
-    if body >= avg_body:
-        score += 1
-        why.append("thân nến lớn hơn trung bình")
-    if v >= 1.2 * avg_vol:
-        score += 1
-        why.append("volume cao")
-    if (side == "SHORT" and r6 >= 25) or (side == "LONG" and r6 <= 75):
-        score += 1
-        why.append("RSI chưa cực đoan")
     sgn = -1 if side == "SHORT" else 1
-    return {
-        "inst": inst, "side": side, "entry": c, "sl": sl,
-        "risk_pct": risk / c * 100, "dist": dist, "rsi": r6,
-        "tp2": c + sgn * 2 * risk, "tp3": c + sgn * 3 * risk,
-        "score": score, "why": why,
-    }
+    tp = entry + sgn * rew * risk
+    last = min(i + MAXH, len(cs) - 1)
+    for j in range(i + 1, last + 1):
+        _, _, h, l, c = cs[j]
+        if side == "SHORT":
+            if h >= sl:
+                return -1.0, j
+            if l <= tp:
+                return rew, j
+        else:
+            if l <= sl:
+                return -1.0, j
+            if h >= tp:
+                return rew, j
+    if i + MAXH >= len(cs):
+        return None
+    return sgn * (cs[last][4] - entry) / risk, last
 
 
 def send(text):
     print(text)
     if not (TOKEN and CHAT_ID):
         return
-    requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": text[:4000]},
-        timeout=15,
-    )
+    for k in range(0, len(text), 3800):
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": text[k:k + 3800]},
+            timeout=15)
+
+
+def stats(tr, cutoff):
+    if not tr:
+        return "0 lệnh"
+    n = len(tr)
+    w = sum(1 for t in tr if t[0] > 0)
+    avg = sum(t[0] for t in tr) / n
+    rec = [t[0] for t in tr if t[1] >= cutoff]
+    ra = f"{sum(rec) / len(rec):+.2f}R/{len(rec)}" if rec else "-"
+    return (f"{n} lệnh | thắng {w / n * 100:.0f}% | TB {avg:+.2f}R"
+            f" | 1 năm: {ra}")
 
 
 def main():
-    t = api("/api/v5/market/tickers", {"instType": "SPOT"})["data"]
-    t = [x for x in t
-         if x["instId"].endswith("-USDT")
+    t = requests.get(BASE + "/api/v5/market/tickers",
+                     params={"instType": "SPOT"}, timeout=20).json()["data"]
+    t = [x for x in t if x["instId"].endswith("-USDT")
          and x["instId"].split("-")[0] not in STABLES]
     t.sort(key=lambda x: float(x["volCcy24h"]), reverse=True)
-    found = []
+    data = {}
     for x in t[:TOP_N]:
         try:
-            res = analyze(x["instId"])
-            if res:
-                found.append(res)
+            cs = load(x["instId"])
+            if len(cs) >= 260:
+                data[x["instId"]] = (cs, signals(cs))
         except Exception as e:
             print("loi", x["instId"], e)
-    found.sort(key=lambda r: (-r["score"], r["side"] != "SHORT", r["dist"]))
-    picks = [r for r in found if r["score"] >= MIN_SCORE][:2]
-    if not picks:
-        send(f"Nến ngày vừa đóng: không có kèo nhấn chìm nào nằm sát "
-             f"EMA (trong {MAX_DIST:.0f}%) đạt chuẩn.\n"
-             "Không có kèo thì nghỉ, đừng ép vào lệnh.")
-        return
-    msg = ("Kèo nhấn chìm sát EMA, nến ngày vừa đóng\n"
-           "Theo backtest: SHORT có lợi thế, LONG gần hòa vốn.\n")
-    for i, r in enumerate(picks, 1):
-        tag = "" if r["side"] == "SHORT" else " (kèo yếu hơn)"
-        msg += (
-            f"\n{i}) {r['inst']} - {r['side']}{tag} "
-            f"(điểm {r['score']}/3)\n"
-            f"Vào ~{r['entry']:.6g}\n"
-            f"SL tham khảo (đỉnh/đáy nến): {r['sl']:.6g} "
-            f"({r['risk_pct']:.1f}%)\n"
-            f"TP 2R: {r['tp2']:.6g} | TP 3R: {r['tp3']:.6g}\n"
-            f"Cách EMA gần nhất: {r['dist']:.1f}% | "
-            f"RSI6: {r['rsi']:.0f}\n"
-            f"Lý do: {'; '.join(r['why'])}\n"
-        )
-    msg += ("\nTự xem biểu đồ, vùng cung cầu và SL trước khi vào lệnh. "
-            "Không phải lời khuyên đầu tư.")
+    max_ts = max(cs[-1][0] for cs, _ in data.values())
+    cutoff = max_ts - 365 * 86400000
+    msg = (f"BACKTEST mô hình nến, khung ngày, {len(data)} coin\n"
+           "Giảm: nến cuối đóng dưới 3 EMA. Tăng: đóng trên 3 EMA. "
+           "Cụm nến chạm vùng EMA. SL đỉnh/đáy cụm, "
+           f"giữ tối đa {MAXH} ngày.\n")
+    for name in NAMES:
+        msg += f"\n=== {name} ===\n"
+        for rew in (1.5, 2, 3):
+            trades = []
+            for inst, (cs, sig) in data.items():
+                s = sig[name]
+                i = 210
+                while i < len(cs) - 1:
+                    if i in s:
+                        r = simulate(cs, i, s[i][0], s[i][1], rew)
+                        if r:
+                            trades.append((r[0], cs[i][0], s[i][0]))
+                            i = r[1] + 1
+                            continue
+                    i += 1
+            msg += f"[TP {rew}R] Tất cả: {stats(trades, cutoff)}\n"
+            for sd in ("LONG", "SHORT"):
+                sub = [x for x in trades if x[2] == sd]
+                if sub:
+                    msg += f"  {sd}: {stats(sub, cutoff)}\n"
+    msg += ("\nDữ liệu quá khứ của top coin hiện tại, chưa tính phí và "
+            "trượt giá. Không phải lời khuyên đầu tư.")
     send(msg)
 
 
