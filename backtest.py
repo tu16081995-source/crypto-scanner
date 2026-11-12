@@ -4,178 +4,153 @@ import requests
 
 BASE = "https://www.okx.com"
 TOP_N = 100
-PAGES = 10
-MAXH = 30
+MAX_DIST = 3.0
+MIN_SCORE = 2
 STABLES = {"USDC", "DAI", "TUSD", "FDUSD", "USDD", "PYUSD", "USDG"}
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
-def load(inst):
-    rows, after = [], None
-    for _ in range(PAGES):
-        p = {"instId": inst, "bar": "1Dutc", "limit": "100"}
-        if after:
-            p["after"] = after
-        r = requests.get(BASE + "/api/v5/market/history-candles",
-                         params=p, timeout=20).json()
-        d = r.get("data", [])
-        if not d:
-            break
-        rows += d
-        after = d[-1][0]
-        time.sleep(0.12)
-        if len(d) < 100:
-            break
-    rows = [x for x in rows if x[8] == "1"]
-    rows.sort(key=lambda x: int(x[0]))
-    return [(int(x[0]), float(x[1]), float(x[2]),
-             float(x[3]), float(x[4])) for x in rows]
+def api(path, params):
+    time.sleep(0.25)
+    return requests.get(BASE + path, params=params, timeout=20).json()
 
 
-def ema_series(vals, n):
+def candles(inst):
+    r = api("/api/v5/market/candles",
+            {"instId": inst, "bar": "1Dutc", "limit": "300"})
+    rows = [x for x in r.get("data", []) if x[8] == "1"]
+    rows.reverse()
+    return [(float(x[1]), float(x[2]), float(x[3]),
+             float(x[4]), float(x[5])) for x in rows]
+
+
+def ema(values, n):
     k = 2 / (n + 1)
-    out, e = [], vals[0]
-    for v in vals:
+    e = values[0]
+    for v in values[1:]:
         e = v * k + e * (1 - k)
-        out.append(e)
-    return out
+    return e
 
 
-def signals(cs):
-    cl = [x[4] for x in cs]
-    E = [ema_series(cl, n) for n in (34, 89, 200)]
-    sig = {}
-    for i in range(210, len(cs)):
-        _, po, _, _, pc = cs[i - 1]
-        _, o, h, l, c = cs[i]
-        if abs(c - o) == 0:
-            continue
-        es = [E[0][i], E[1][i], E[2][i]]
-        if pc > po and c < o and o >= pc and c <= po and c < min(es):
-            sig[i] = ("SHORT", h)
-        elif pc < po and c > o and o <= pc and c >= po and c > max(es):
-            sig[i] = ("LONG", l)
-    return sig
+def rsi(closes, n=6):
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    ag = sum(gains[:n]) / n
+    al = sum(losses[:n]) / n
+    for i in range(n, len(gains)):
+        ag = (ag * (n - 1) + gains[i]) / n
+        al = (al * (n - 1) + losses[i]) / n
+    if al == 0:
+        return 100.0
+    return 100 - 100 / (1 + ag / al)
 
 
-def pivot_target(cs, i, side, entry):
-    lo = max(3, i - 120)
-    best = None
-    for k in range(lo, i - 2):
-        if side == "SHORT":
-            v = cs[k][3]
-            nb = [cs[j][3] for j in range(k - 3, k + 4) if j != k]
-            if v < min(nb) and v < entry:
-                best = v if best is None else max(best, v)
-        else:
-            v = cs[k][2]
-            nb = [cs[j][2] for j in range(k - 3, k + 4) if j != k]
-            if v > max(nb) and v > entry:
-                best = v if best is None else min(best, v)
-    return best
-
-
-def simulate(cs, i, side, sl, tp_mode):
-    entry = cs[i][4]
-    risk = abs(sl - entry)
+def analyze(inst):
+    cs = candles(inst)
+    if len(cs) < 210:
+        return None
+    closes = [x[3] for x in cs]
+    es = [ema(closes, 34), ema(closes, 89), ema(closes, 200)]
+    po, ph, pl, pc, pv = cs[-2]
+    o, h, l, c, v = cs[-1]
+    body = abs(c - o)
+    pbody = abs(pc - po)
+    if body == 0 or pbody == 0 or body < 1.5 * pbody:
+        return None
+    side = None
+    if pc > po and c < o and o >= pc and c <= po and c < min(es):
+        if h < min(es):
+            return None
+        side, sl = "SHORT", h
+        dist = (min(es) - c) / c * 100
+    elif pc < po and c > o and o <= pc and c >= po and c > max(es):
+        if l > max(es):
+            return None
+        side, sl = "LONG", l
+        dist = (c - max(es)) / c * 100
+    if not side:
+        return None
+    if dist > MAX_DIST:
+        return None
+    risk = abs(sl - c)
     if risk == 0:
         return None
+    avg_body = sum(abs(x[3] - x[0]) for x in cs[-12:-2]) / 10
+    avg_vol = sum(x[4] for x in cs[-22:-2]) / 20
+    r6 = rsi(closes, 6)
+    score = 0
+    why = []
+    if body >= avg_body:
+        score += 1
+        why.append("thân nến lớn hơn trung bình")
+    if v >= 1.2 * avg_vol:
+        score += 1
+        why.append("volume cao")
+    if (side == "SHORT" and r6 >= 25) or (side == "LONG" and r6 <= 75):
+        score += 1
+        why.append("RSI chưa cực đoan")
     sgn = -1 if side == "SHORT" else 1
-    if tp_mode == "swing":
-        lvl = pivot_target(cs, i, side, entry)
-        if lvl is None:
-            return None
-        rew = abs(entry - lvl) / risk
-        if rew < 1:
-            return None
-        tp = lvl
-    else:
-        rew = tp_mode
-        tp = entry + sgn * rew * risk
-    last = min(i + MAXH, len(cs) - 1)
-    for j in range(i + 1, last + 1):
-        _, _, h, l, c = cs[j]
-        if side == "SHORT":
-            if h >= sl:
-                return -1.0, j
-            if l <= tp:
-                return rew, j
-        else:
-            if l <= sl:
-                return -1.0, j
-            if h >= tp:
-                return rew, j
-    if i + MAXH >= len(cs):
-        return None
-    return sgn * (cs[last][4] - entry) / risk, last
+    return {
+        "inst": inst, "side": side, "entry": c, "sl": sl,
+        "risk_pct": risk / c * 100, "dist": dist, "rsi": r6,
+        "tp2": c + sgn * 2 * risk, "tp3": c + sgn * 3 * risk,
+        "score": score, "why": why,
+    }
 
 
 def send(text):
     print(text)
     if not (TOKEN and CHAT_ID):
         return
-    for k in range(0, len(text), 3800):
-        requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": text[k:k + 3800]},
-            timeout=15)
-
-
-def stats(tr, cutoff):
-    if not tr:
-        return "0 lệnh"
-    n = len(tr)
-    w = sum(1 for t in tr if t[0] > 0)
-    avg = sum(t[0] for t in tr) / n
-    rec = [t[0] for t in tr if t[1] >= cutoff]
-    ra = f"{sum(rec) / len(rec):+.2f}R/{len(rec)}" if rec else "-"
-    return (f"{n} lệnh | thắng {w / n * 100:.0f}% | TB {avg:+.2f}R"
-            f" | 1 năm gần: {ra}")
+    requests.post(
+        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+        data={"chat_id": CHAT_ID, "text": text[:4000]},
+        timeout=15,
+    )
 
 
 def main():
-    t = requests.get(BASE + "/api/v5/market/tickers",
-                     params={"instType": "SPOT"}, timeout=20).json()["data"]
-    t = [x for x in t if x["instId"].endswith("-USDT")
+    t = api("/api/v5/market/tickers", {"instType": "SPOT"})["data"]
+    t = [x for x in t
+         if x["instId"].endswith("-USDT")
          and x["instId"].split("-")[0] not in STABLES]
     t.sort(key=lambda x: float(x["volCcy24h"]), reverse=True)
-    data = {}
+    found = []
     for x in t[:TOP_N]:
         try:
-            cs = load(x["instId"])
-            if len(cs) >= 260:
-                data[x["instId"]] = (cs, signals(cs))
+            res = analyze(x["instId"])
+            if res:
+                found.append(res)
         except Exception as e:
             print("loi", x["instId"], e)
-    max_ts = max(cs[-1][0] for cs, _ in data.values())
-    cutoff = max_ts - 365 * 86400000
-    tps = [1, 1.5, 2, 3, "swing"]
-    msg = (f"BACKTEST nến nhấn chìm khung ngày\n{len(data)} coin\n"
-           "Luật: nhấn chìm bao trọn thân nến trước, đóng cửa ngoài "
-           "cả 3 EMA. Không lọc râu, không lọc khoảng cách.\n"
-           f"Vào ở giá đóng cửa, SL ở đỉnh/đáy nến, giữ tối đa {MAXH} ngày\n"
-           "(TP: số = chốt theo R, swing = đáy/đỉnh gần nhất)\n")
-    for tp in tps:
-        trades = []
-        for inst, (cs, sig) in data.items():
-            i = 210
-            while i < len(cs) - 1:
-                s = sig.get(i)
-                if s:
-                    r = simulate(cs, i, s[0], s[1], tp)
-                    if r:
-                        trades.append((r[0], cs[i][0], s[0]))
-                        i = r[1] + 1
-                        continue
-                i += 1
-        lab = f"TP {tp}R" if tp != "swing" else "TP swing"
-        msg += f"\n[{lab}]\n"
-        msg += f"Tất cả: {stats(trades, cutoff)}\n"
-        for sd in ("LONG", "SHORT"):
-            msg += f"{sd}: {stats([x for x in trades if x[2] == sd], cutoff)}\n"
-    msg += ("\nLưu ý: dữ liệu quá khứ của top coin hiện tại, "
-            "chưa tính phí và trượt giá. Không phải lời khuyên đầu tư.")
+    found.sort(key=lambda r: (-r["score"], r["side"] != "SHORT", r["dist"]))
+    picks = [r for r in found if r["score"] >= MIN_SCORE][:2]
+    if not picks:
+        send(f"Nến ngày vừa đóng: không có kèo nhấn chìm nào nằm sát "
+             f"EMA (trong {MAX_DIST:.0f}%) đạt chuẩn.\n"
+             "Không có kèo thì nghỉ, đừng ép vào lệnh.")
+        return
+    msg = ("Kèo nhấn chìm sát EMA, nến ngày vừa đóng\n"
+           "Theo backtest: SHORT có lợi thế, LONG gần hòa vốn.\n")
+    for i, r in enumerate(picks, 1):
+        tag = "" if r["side"] == "SHORT" else " (kèo yếu hơn)"
+        msg += (
+            f"\n{i}) {r['inst']} - {r['side']}{tag} "
+            f"(điểm {r['score']}/3)\n"
+            f"Vào ~{r['entry']:.6g}\n"
+            f"SL tham khảo (đỉnh/đáy nến): {r['sl']:.6g} "
+            f"({r['risk_pct']:.1f}%)\n"
+            f"TP 2R: {r['tp2']:.6g} | TP 3R: {r['tp3']:.6g}\n"
+            f"Cách EMA gần nhất: {r['dist']:.1f}% | "
+            f"RSI6: {r['rsi']:.0f}\n"
+            f"Lý do: {'; '.join(r['why'])}\n"
+        )
+    msg += ("\nTự xem biểu đồ, vùng cung cầu và SL trước khi vào lệnh. "
+            "Không phải lời khuyên đầu tư.")
     send(msg)
 
 
