@@ -3,7 +3,8 @@ import time
 import requests
 
 BASE = "https://www.okx.com"
-TOP_N = 100
+TOP_N = 400
+MIN_VOL_USDT = 3000000
 MAX_DIST = 3.0
 MIN_SCORE = 2
 STABLES = {"USDC", "DAI", "TUSD", "FDUSD", "USDD", "PYUSD", "USDG"}
@@ -12,7 +13,7 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
 def api(path, params):
-    time.sleep(0.25)
+    time.sleep(0.2)
     return requests.get(BASE + path, params=params, timeout=20).json()
 
 
@@ -117,10 +118,12 @@ def main():
     t = api("/api/v5/market/tickers", {"instType": "SPOT"})["data"]
     t = [x for x in t
          if x["instId"].endswith("-USDT")
-         and x["instId"].split("-")[0] not in STABLES]
+         and x["instId"].split("-")[0] not in STABLES
+         and float(x["volCcy24h"]) >= MIN_VOL_USDT]
     t.sort(key=lambda x: float(x["volCcy24h"]), reverse=True)
+    t = t[:TOP_N]
     found = []
-    for x in t[:TOP_N]:
+    for x in t:
         try:
             res = analyze(x["instId"])
             if res:
@@ -129,12 +132,13 @@ def main():
             print("loi", x["instId"], e)
     found.sort(key=lambda r: (-r["score"], r["side"] != "SHORT", r["dist"]))
     picks = [r for r in found if r["score"] >= MIN_SCORE][:2]
+    head = f"(Đã quét {len(t)} coin, khối lượng từ 3 triệu USDT)\n"
     if not picks:
-        send(f"Nến ngày vừa đóng: không có kèo nhấn chìm nào nằm sát "
-             f"EMA (trong {MAX_DIST:.0f}%) đạt chuẩn.\n"
+        send(head + f"Không có kèo nhấn chìm nào nằm sát EMA "
+             f"(trong {MAX_DIST:.0f}%) đạt chuẩn.\n"
              "Không có kèo thì nghỉ, đừng ép vào lệnh.")
         return
-    msg = ("Kèo nhấn chìm sát EMA, nến ngày vừa đóng\n"
+    msg = ("Kèo nhấn chìm sát EMA, nến ngày vừa đóng\n" + head +
            "Theo backtest: SHORT có lợi thế, LONG gần hòa vốn.\n")
     for i, r in enumerate(picks, 1):
         tag = "" if r["side"] == "SHORT" else " (kèo yếu hơn)"
